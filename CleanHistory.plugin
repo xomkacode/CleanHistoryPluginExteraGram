@@ -1,0 +1,214 @@
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import (
+    get_connections_manager,
+    get_last_fragment,
+    get_messages_controller,
+    get_user_config,
+    send_request,
+)
+from android_utils import run_on_ui_thread
+from java import jint
+from org.telegram.messenger import ApplicationLoader, LocaleController
+from org.telegram.tgnet import TLRPC
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+
+
+__id__ = "msgsDeleter"
+__name__ = "Чистая история"
+__description__ = "Удаляет все ваши сообщения из открытого чата, включая групповые комментарии."
+__icon__ = "exteraPlugins/1"
+__version__ = "2.0.0"
+__author__ = "@homkaplugin"
+__min_version__ = "11.12.0"
+
+
+class CleanHistoryPlugin(BasePlugin):
+    PAGE_SIZE = 100
+    DELETE_BATCH_SIZE = 100
+
+    def on_plugin_load(self):
+        russian = self._is_russian()
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text="Очистить мои сообщения" if russian else "Clear my messages",
+                subtext="Только сообщения этого аккаунта" if russian else "Only messages from this account",
+                icon="msg_delete",
+                priority=20,
+                on_click=self._on_menu_click,
+            )
+        )
+
+    @staticmethod
+    def _is_russian():
+        try:
+            return LocaleController.getInstance().getCurrentLocale().getLanguage().startswith("ru")
+        except Exception:
+            return True
+
+    def _on_menu_click(self, context):
+        dialog_id = context.get("dialog_id")
+        if dialog_id is None:
+            self._notify("Не удалось определить чат", "Открой меню из нужного чата.")
+            return
+
+        is_ru = self._is_russian()
+        fragment = context.get("fragment") or get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else ApplicationLoader.applicationContext
+        if not activity:
+            return
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Удалить сообщения?" if is_ru else "Delete messages?")
+        builder.set_message(
+            "Удалить все найденные сообщения, отправленные твоим аккаунтом? "
+            "Это действие нельзя отменить."
+            if is_ru else
+            "Delete all found messages sent by your account? This cannot be undone."
+        )
+        peer_object = context.get("chat") or context.get("user")
+        builder.set_positive_button(
+            "Да" if is_ru else "Yes",
+            lambda dialog, which: self._begin_cleanup(
+                int(dialog_id), peer_object, delete_without_local_copy=True
+            ),
+        )
+        builder.set_negative_button(
+            "Нет" if is_ru else "No",
+            lambda dialog, which: dialog.dismiss(),
+        )
+        builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        builder.show()
+
+    def _begin_cleanup(self, dialog_id, peer_object, delete_without_local_copy):
+        try:
+            controller = get_messages_controller()
+            if peer_object is None:
+                peer_object = (
+                    controller.getUser(dialog_id)
+                    if dialog_id > 0
+                    else controller.getChat(-dialog_id)
+                )
+            if peer_object is None:
+                self._notify("Не удалось определить чат", "Открой чат заново и повтори.")
+                return
+
+            peer = controller.getInputPeer(peer_object)
+            current_user = get_user_config().getCurrentUser()
+            if current_user is None:
+                self._notify("Нет активного аккаунта", "Войди в аккаунт и повтори.")
+                return
+            sender = controller.getInputPeer(current_user)
+            cutoff = int(get_connections_manager().getCurrentTime())
+
+            state = {
+                "ids": [],
+                "peer": peer,
+                "dialog_id": dialog_id,
+                "cutoff": cutoff,
+                "delete_without_local_copy": delete_without_local_copy,
+            }
+            self._search_page(state, sender, offset_id=0)
+        except Exception as exc:
+            self.logger.exception("Could not start cleanup: %s", exc)
+            self._notify("Не удалось начать", str(exc))
+
+    def _search_page(self, state, sender, offset_id):
+        request = TLRPC.TL_messages_search()
+        request.peer = state["peer"]
+        request.limit = self.PAGE_SIZE
+        request.q = ""
+        request.offset_id = int(offset_id)
+        request.from_id = sender
+        request.flags |= 1
+        request.filter = TLRPC.TL_inputMessagesFilterEmpty()
+        request.hash = 0
+
+        def on_result(response, error):
+            if error:
+                self._notify("Ошибка поиска", str(error.text))
+                return
+
+            messages = getattr(response, "messages", None)
+            if messages is None or messages.isEmpty():
+                self._delete_found(state, 0)
+                return
+
+            page = list(messages.toArray())
+            oldest_id = min(int(message.id) for message in page)
+            for message in page:
+                if message.out and not message.post and int(message.date) < state["cutoff"]:
+                    state["ids"].append(int(message.id))
+
+            if len(page) < self.PAGE_SIZE or (offset_id and oldest_id >= offset_id):
+                self._delete_found(state, 0)
+            else:
+                self._search_page(state, sender, oldest_id)
+
+        send_request(request, on_result)
+
+    def _delete_found(self, state, offset):
+        message_ids = sorted(set(state["ids"]))
+        batch = message_ids[offset:offset + self.DELETE_BATCH_SIZE]
+        if not batch:
+            if not message_ids:
+                self._notify("Готово", "Твои сообщения не найдены." if self._is_russian() else "No messages found.")
+            else:
+                self._notify(
+                    "Готово",
+                    f"Удалено сообщений: {len(message_ids)}" if self._is_russian()
+                    else f"Deleted messages: {len(message_ids)}",
+                )
+            return
+
+        try:
+            peer = state["peer"]
+            channel_id = getattr(peer, "channel_id", None)
+            if channel_id is not None:
+                request = TLRPC.TL_channels_deleteMessages()
+                channel = TLRPC.TL_inputChannel()
+                channel.channel_id = int(channel_id)
+                channel.access_hash = int(peer.access_hash)
+                request.channel = channel
+            else:
+                request = TLRPC.TL_messages_deleteMessages()
+                request.revoke = True
+
+            for message_id in batch:
+                request.id.add(jint(message_id))
+
+            if state["delete_without_local_copy"]:
+                try:
+                    from com.radolyn.ayugram import AyuState
+                    for message_id in batch:
+                        AyuState.permitDeleteMessage(state["dialog_id"], jint(message_id))
+                except Exception:
+                    pass
+
+            def on_deleted(response, error):
+                if error:
+                    self._notify("Ошибка удаления", str(error.text))
+                    return
+                self._delete_found(state, offset + len(batch))
+
+            send_request(request, on_deleted)
+        except Exception as exc:
+            self.logger.exception("Could not delete messages: %s", exc)
+            self._notify("Ошибка удаления", str(exc))
+
+    def _notify(self, title, message):
+        def show():
+            try:
+                BulletinHelper.show_info(f"{title}: {message}")
+            except Exception:
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment else ApplicationLoader.applicationContext
+                if activity:
+                    builder = AlertDialogBuilder(activity)
+                    builder.set_title(title)
+                    builder.set_message(message)
+                    builder.set_positive_button("OK", lambda dialog, which: dialog.dismiss())
+                    builder.show()
+
+        run_on_ui_thread(show)
